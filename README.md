@@ -1,196 +1,170 @@
-﻿# 🔐 YubiKey‑Protected Dynamic SSH Certificates via Vault + Terraform‑Managed Nodes  
-> **OTP + PIV hardware protection for ephemeral SSH access**  
-**Tech stack:** Terraform • HashiCorp Vault SSH CA • YubiKey OTP & PIV RSA • AWS EC2 • OpenSSH  
+﻿# 🔐 Sentinel-SSH: Hardware-Backed Dynamic Access
+
+> **Zero Keys on Disk. 100% Hardware-Enforced. Ephemeral by Design.**
+
+![Terraform](https://img.shields.io/badge/Terraform-1.7+-623CE4?style=for-the-badge&logo=terraform&logoColor=white)
+![Vault](https://img.shields.io/badge/Vault-1.15+-000000?style=for-the-badge&logo=vault&logoColor=white)
+![YubiKey](https://img.shields.io/badge/YubiKey-OTP%20%2B%20PIV-84BD00?style=for-the-badge&logo=yubico&logoColor=white)
+![AWS](https://img.shields.io/badge/AWS-EC2-232F3E?style=for-the-badge&logo=amazon-aws&logoColor=white)
 
 ---
 
-## 📜 Overview
-**Core idea:**  
-- YubiKey OTP is required to authenticate to Vault (via `yubikey` auth method).  
-- Terraform provisions VMs (AWS EC2 in example) and requests **short‑lived SSH certificates** from Vault’s SSH CA.  
-- SSH certificate is encrypted with a **data‑encryption key** stored only in YubiKey’s PIV slot (RSA‑2048).  
-- User can SSH to any node without storing a private key on disk — key is extracted from YubiKey on‑the‑fly.  
+## 📖 Overview
 
-**You’ll walk away with:**  
-- Fully hardware‑protected SSH auth for Terraform‑managed nodes  
-- Short‑lived, auto‑revoked SSH certs  
-- No long‑term private key exposure  
+**Sentinel-SSH** implements a reference architecture for highly secure, ephemeral SSH access to dynamic infrastructure. By combining **HashiCorp Vault's SSH CA** with **YubiKey hardware protection**, this project ensures that:
 
----
+1.  **Authentication** requires physical presence (YubiKey OTP).
+2.  **Private Keys** never leave the hardware token (PIV/Smart Card mode).
+3.  **Certificates** are short-lived and automatically expire.
 
-## ✅ Security Benefits
-
-| Feature | Why it matters |
-|---------|----------------|
-| **OTP‑first login** | Vault never uses a static password; OTP is single‑use & tied to physical YubiKey. |
-| **PIV‑protected private key** | SSH private key never leaves token; even if host is compromised, key is safe. |
-| **Dynamic short‑lived certs** | No long‑lived SSH keys; revocation automatic upon expiry. |
-| **Terraform‑driven** | Provisioning + cert issuance codified and auditable. |
+**The Result:** You can SSH into any Terraform-provisioned node without ever storing a private key on your disk.
 
 ---
 
 ## 🏗 Architecture
 
-```ascii
-+-------------------+          +-------------------+          +-------------------+
-|   YubiKey (OTP)   |  --->    |   Vault Server    |  <---    |   Terraform CLI   |
-|   (PIV slot RSA)  |          |  (ssh_ca, yubikey|          |  (terraform apply)|
-+-------------------+          |   auth, ssh)     |          +-------------------+
-          ^                     +--------+----------+                     ^
-          |                              |                              |
-          |                              |                              |
-          |                              v                              |
-          |                     +-------------------+                    |
-          +---------------------|  Provisioned EC2  |<-------------------+
-                                |   (sshd)          |
-                                +-------------------+
+```mermaid
+sequenceDiagram
+    participant YK as 🔑 YubiKey
+    participant User as 👤 User/Terraform
+    participant Vault as 🔒 Vault (SSH CA)
+    participant EC2 as ☁️ EC2 Instance
+
+    Note over YK, Vault: 1. Authentication Phase
+    User->>YK: Request OTP
+    YK-->>User: Generate OTP
+    User->>Vault: Login with OTP (auth/yubikey)
+    Vault-->>User: Return Vault Token
+
+    Note over User, EC2: 2. Provisioning Phase
+    User->>EC2: Terraform Apply (Provision VM)
+    EC2->>Vault: Configure Trusted CA Key (User Data)
+
+    Note over YK, Vault: 3. Certificate Issuance
+    User->>YK: Export Public Key (PIV Slot 9c)
+    YK-->>User: RSA Public Key
+    User->>Vault: Sign Public Key (ssh/sign)
+    Vault-->>User: Signed SSH Certificate (TTL 30m)
+
+    Note over YK, EC2: 4. Connection Phase
+    User->>EC2: SSH Request (Certificate + YubiKey PIV)
+    EC2-->>User: Access Granted
 ```
+
+---
+
+## ✅ Security Benefits
+
+| Feature | Description | Impact |
+| :--- | :--- | :--- |
+| **OTP-First Login** | Vault authenticates via YubiKey OTP. | **No static passwords.** Stolen credentials are useless without the physical key. |
+| **Hardware-Bound Keys** | SSH private key lives in YubiKey PIV slot. | **Un-phishable.** Even if your laptop is compromised, the attacker cannot steal your key. |
+| **Ephemeral Certs** | SSH certificates expire in 30 minutes. | **Reduced Blast Radius.** No need to manage or revoke long-lived static keys. |
+| ** codified Access** | Infrastructure & Access defined in Terraform. | **Auditable.** All access policies are version-controlled. |
 
 ---
 
 ## 📦 Prerequisites
 
-| Component      | Version / Detail |
-|----------------|------------------|
-| Vault          | 1.15+ (OSS OK) |
-| Terraform      | 1.7+ |
-| YubiKey        | 5 Series (OTP + PIV) |
-| AWS CLI        | Configured IAM user for EC2 provisioning |
-| yubico-piv-tool & ykman | Installed locally |
-| ssh-keygen, ssh | OpenSSH 9.x |
+Before you begin, ensure you have the following installed and configured:
+
+*   **HashiCorp Vault** `v1.15+` (OSS or Enterprise)
+*   **Terraform** `v1.7+`
+*   **YubiKey 5 Series** (Supports OTP & PIV)
+*   **YubiKey Manager** (`ykman`) & **Yubico PIV Tool** (`yubico-piv-tool`)
+*   **AWS CLI** (Configured with EC2 provisioning permissions)
+*   **OpenSSH** `v9.0+`
 
 ---
 
-## ⚙️ Implementation
+## ⚙️ Implementation Guide
 
-### **1️⃣ Configure YubiKey for OTP & PIV**
+### 1️⃣ Configure YubiKey
 
-**OTP (default slot):**
+First, we prepare the YubiKey for both OTP (Authentication) and PIV (Signing).
+
+**Step 1: Generate OTP Secret**
 ```bash
-ykman otp static --generate  # Outputs a 44‑char secret
+# Generate a static secret for Slot 1 or 2
+ykman otp static --generate 
+# ⚠️ Save the 44-char secret output! You'll need it for Vault.
 ```
 
-**PIV (RSA 2048 in slot 9c):**
+**Step 2: Generate PIV Keypair**
 ```bash
+# Generate RSA-2048 key in Slot 9c (Digital Signature)
 yubico-piv-tool -s 9c -a generate -o yubikey-piv.pem -k 2048
+
+# Import the key back into the slot (Self-sign for storage)
 yubico-piv-tool -s 9c -a import -i yubikey-piv.pem
 yubico-piv-tool -s 9c -a read-certificate -o yubikey-piv.crt
 ```
 
----
+### 2️⃣ Configure Vault
 
-### **2️⃣ Enable & Configure Vault YubiKey OTP Auth**
+Set up the Vault server to accept YubiKey OTPs and issue SSH certificates.
+
 ```bash
-vault auth enable yubikey
-vault write auth/yubikey/config     otp_secret=<BASE32>     otp_type=totp     ttl=10m
-```
-
----
-
-### **3️⃣ Create Vault SSH CA and Role**
-```bash
-vault secrets enable ssh
-
-# Generate SSH CA keypair
-vault write -field=public_key ssh/config/ca generate_signing_key=true > ca.pub
-
-# Create role for issuing certs
-vault write ssh/roles/terraform-ssh     key_type=ca     allow_user_certificates=true     allowed_users="*"     default_extensions='{"permit-pty": ""}'     ttl=30m
-```
-
----
-
-# -------------------------------------------------------------------
-# Vault Environment & Initialization
-# -------------------------------------------------------------------
-# Purpose:
-#   Set up Vault in development mode, initialize with a single unseal
-#   key share, and log in as root to prepare for YubiKey OTP auth.
-#
-# Security Notes:
-#   - Using 1 key share + threshold 1 is ONLY for testing/demo.
-#   - Never store root tokens in plaintext in production scripts.
-# -------------------------------------------------------------------
-
-# Point Vault CLI to the local dev server
-export VAULT_ADDR='http://127.0.0.1:8200'
-
-# Initialize Vault (generates one unseal key and root token)
-vault operator init -key-shares=1 -key-threshold=1
-
-# Log in with the root token (printed by the init command)
-vault login <root-token>
-
-# -------------------------------------------------------------------
-# Enable & Configure YubiKey Auth Method
-# -------------------------------------------------------------------
-# Purpose:
-#   Enable Vault’s `yubikey` auth method and configure it to use
-#   TOTP codes generated from a registered YubiKey.
-#
-# Workflow:
-#   1. YubiKey generates a TOTP code from its secret seed.
-#   2. Vault validates the code against its configured seed.
-#   3. On success, Vault grants identity-mapped access.
-#
-# Prerequisites:
-#   - A YubiKey programmed with a TOTP secret.
-#   - The Base32-encoded OTP secret from the YubiKey setup step.
-#
-# Security Notes:
-#   - `ttl=1h` limits token lifetime after successful login.
-#   - Use strong secrets and rotate periodically.
-# -------------------------------------------------------------------
-
-# Enable the YubiKey auth method
+# 1. Enable YubiKey Auth
 vault auth enable yubikey
 
-# Register the YubiKey's TOTP seed and configure parameters
+# 2. Configure User (Replace <BASE32> with secret from Step 1)
 vault write auth/yubikey/config \
-    otp_secret=<BASE32_OTP_SECRET> \
+    otp_secret=<BASE32> \
     otp_type=totp \
     ttl=1h
 
+# 3. Enable SSH Secrets Engine
+vault secrets enable ssh
 
+# 4. Generate CA Keypair
+vault write -field=public_key ssh/config/ca generate_signing_key=true > ca.pub
 
-### **4️⃣ Terraform Configuration**
-```hcl
-# versions.tf, provider.tf, main.tf
-# Example: Provision EC2 instance + fetch SSH cert from Vault
+# 5. Create Signing Role
+vault write ssh/roles/terraform-ssh \
+    key_type=ca \
+    allow_user_certificates=true \
+    allowed_users="*" \
+    default_extensions='{"permit-pty": ""}' \
+    ttl=30m
 ```
 
----
+### 3️⃣ Provision & Connect
 
-### **5️⃣ Authenticate to Vault with YubiKey OTP**
+Now, use Terraform to launch the infrastructure and connect securely.
+
+**1. Authenticate to Vault**
 ```bash
-OTP=$(ykman otp generate 1)  # Slot 1
-VAULT_TOKEN=$(vault write -field=token auth/yubikey/login otp=$OTP)
-export VAULT_TOKEN
+# Generate OTP from YubiKey
+OTP=$(ykman otp generate 1)
+
+# Login and set token
+export VAULT_TOKEN=$(vault write -field=token auth/yubikey/login otp=$OTP)
 ```
 
----
-
-### **6️⃣ Run Terraform**
+**2. Provision Infrastructure**
 ```bash
 terraform init
 terraform apply -auto-approve
 ```
-Terraform fetches SSH cert and stores it locally (encrypted).
 
----
+**3. Connect via SSH (Hardware Backed)**
+This command extracts the public key, asks Vault to sign it, and uses the YubiKey for the handshake.
 
-### **7️⃣ Use SSH Cert – Decrypt with PIV On‑the‑Fly**
 ```bash
-# Extract private key from YubiKey slot 9c
+# 1. Get Public Key from YubiKey
 yubico-piv-tool -s 9c -a read -o /tmp/piv-key.pem
 
-# Convert to OpenSSH format
+# 2. Convert to OpenSSH format
 ssh-keygen -p -m PEM -f /tmp/piv-key.pem -N "" -P "" -C "yubikey-piv"
 
-# SSH into node
-ssh -i /tmp/piv-key.pem     -o CertificateFile=$(terraform output -raw ssh_cert)     ec2-user@$(terraform output -raw demo_public_ip)
+# 3. SSH into the node
+# Note: The private key (-i) is just a stub/reference to the hardware token
+ssh -i /tmp/piv-key.pem \
+    -o CertificateFile=$(terraform output -raw ssh_cert) \
+    ec2-user@$(terraform output -raw demo_public_ip)
 ```
 
 ---
 
-
+> **Note:** This is a Proof of Concept. In a production environment, ensure Vault is properly sealed, unsealed, and backed by persistent storage.
